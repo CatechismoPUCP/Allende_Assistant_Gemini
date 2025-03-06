@@ -1,56 +1,127 @@
+import os
 import streamlit as st
-from openai import OpenAI
+import google.generativeai as genai
+import time
+from datetime import datetime
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+# --- Constants and Configurations ---
+API_KEY = "AIzaSyAhJyraVxu3WTX_WIaMKAu744DdgYlad00"  # Consider using st.secrets
+PROMPTS_FOLDER = "Character_Prompts"
+ICONS_FOLDER = "character_ico"
+DEFAULT_SAFETY = "Low"  # Safety setting
+MODEL_NAME = "gemini-1.5-pro"
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# --- Configure Gemini ---
+os.environ["API_KEY"] = API_KEY  # Or use st.secrets for better security
+genai.configure(api_key=os.environ["API_KEY"])
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+# --- Utility Functions ---
+@st.cache_data
+def get_character_files():
+    return [f.split('.')[0] for f in os.listdir(PROMPTS_FOLDER) if f.endswith('.txt')]
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+@st.cache_data
+def load_character_prompt(selected_character):
+    character_prompt_file = os.path.join(PROMPTS_FOLDER, f"{selected_character}.txt")
+    with open(character_prompt_file, 'r', encoding='utf-8') as f:
+        return f.read()
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+def process_response(response_text):
+    parts = {}
+    for key in ["question_analysis", "answer", "suggested_documents", "citations"]:
+        start_tag, end_tag = f"<{key}>", f"</{key}>"
+        start_idx, end_idx = response_text.find(start_tag), response_text.find(end_tag)
+        parts[key] = response_text[start_idx + len(start_tag):end_idx].strip() if start_idx != -1 and end_idx != -1 else ""
+    return parts
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+def initialize_session_state():
+    defaults = {
+        'chat_history': [],
+        'user_input': "",
+        'chat_session': None,
+        'selected_character': None,
+        'response_time': 0
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+# --- Chat Session Creation ---
+def create_new_chat_session(selected_character):
+    system_prompt = load_character_prompt(selected_character).replace("{{USER_MESSAGE}}", "{user_input}")
+    generation_config = {
+        "temperature": 0.7,
+        "top_p": 0.95,
+        "top_k": 1,
+        "max_output_tokens": 10192,
+    }
+    safety_settings = {
+        "harassment": "BLOCK_NONE", #Example
+        "hate_speech": "BLOCK_NONE", #Example
+        "sexually_explicit": "BLOCK_NONE", #Example
+        "dangerous_content": "BLOCK_NONE", #Example
+    }
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    model = genai.GenerativeModel(
+        model_name=MODEL_NAME,
+        generation_config=generation_config,
+        safety_settings="BLOCK_NONE",
+        system_instruction=system_prompt
+    )
+    return model.start_chat(history=[])
+
+
+# --- Main Application ---
+def main():
+    st.title("Allende Archives AI Assistant")
+    initialize_session_state()
+
+    character_files = get_character_files()
+    selected_character = st.selectbox("Choose a historical character:", character_files, key="char_select")
+
+    if st.session_state.selected_character != selected_character:
+        st.session_state.chat_session = None
+        st.session_state.chat_history = []
+        st.session_state.selected_character = selected_character
+        st.session_state.response_time = 0
+
+
+    # --- Chat Interface ---
+    with st.container():
+        for role, message in st.session_state.chat_history:
+            if role == "You":
+                st.markdown(f"<span style='color: blue;'>You:</span> {message}", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<span style='color: green;'>Archivist:</span> {message['answer']}", unsafe_allow_html=True)
+                with st.expander("Show Analysis and Sources"):
+                    st.markdown("### Question Analysis\n" + message["question_analysis"])
+                    st.markdown("### Suggested Documents\n" + message["suggested_documents"])
+                    st.markdown("### Citations\n" + message["citations"])
+
+    # --- Input and Response Handling ---
+    with st.container():
+        user_input = st.text_input("Enter your message:", key="input_field")
+        if st.button("Send") and user_input:
+            if st.session_state.chat_session is None:
+                st.session_state.chat_session = create_new_chat_session(selected_character)
+
+            start_time = time.time()  # Start timing
+            with st.spinner("Generating response..."):
+                response = st.session_state.chat_session.send_message(user_input)
+            st.session_state.response_time = time.time() - start_time  # End timing
+
+            response_dict = process_response(response.text)
+            st.session_state.chat_history.append(("You", user_input))
+            st.session_state.chat_history.append((selected_character, response_dict))
+            st.rerun()
+
+    # --- Display Response Time ---
+    if st.session_state.response_time > 0:
+        st.write(f"Response time: {st.session_state.response_time:.2f} seconds")
+
+    st.markdown("---")
+    st.write("Powered by Gemini AI")
+
+if __name__ == "__main__":
+    main()
